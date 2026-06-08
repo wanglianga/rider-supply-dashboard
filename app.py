@@ -1,8 +1,12 @@
 import streamlit as st
 import pandas as pd
+import base64
+import json
+from datetime import datetime, date, timedelta
 import plotly.express as px
 import plotly.graph_objects as go
-from datetime import datetime, date
+import io
+from PIL import Image
 
 from data_generator import (
     BUSINESS_DISTRICTS, WEATHER_TYPES, TIME_SLOTS,
@@ -12,21 +16,30 @@ from data_generator import (
     generate_subsidy_suggestion, get_district_responsible,
     get_all_district_responsibles
 )
+from warning_engine import (
+    WARNING_DIMENSIONS, WARNING_LEVELS, DEFAULT_THRESHOLDS,
+    get_effective_thresholds, detect_peak_warning_enhanced,
+    generate_full_snapshot, simulate_post_resolution_state,
+    create_acceptance_scenario
+)
 from log_manager import (
     log_subsidy_operation, record_peak_warning,
-    save_acceptance_snapshot, get_operation_logs,
-    get_peak_warnings, get_acceptance_snapshots,
-    logs_to_dataframe, warnings_to_dataframe, snapshots_to_dataframe
+    record_peak_warning_full, save_acceptance_snapshot,
+    get_operation_logs, get_peak_warnings, query_peak_warnings,
+    get_peak_warning_by_id, get_acceptance_snapshots,
+    logs_to_dataframe, warnings_to_dataframe, snapshots_to_dataframe,
+    clear_all_warnings
 )
 
 st.set_page_config(
-    page_title="外卖商圈骑手供需分析看板",
+    page_title="外卖商圈骑手供需分析看板 · 峰值预警系统",
     page_icon="🛵",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
 st.title("🛵 外卖商圈骑手供需分析看板")
+st.markdown("### 峰值预警 · 全链路回放系统")
 st.markdown("---")
 
 with st.sidebar:
@@ -51,6 +64,85 @@ with st.sidebar:
         for d, r in responsibles.items():
             st.markdown(f"- **{d}**：{r}")
 
+    st.markdown("---")
+    st.markdown("### ⚙️ 预警阈值配置")
+    with st.expander("🔧 四维阈值（支持动态调整）", expanded=False):
+        st.caption("供需比与超时率支持按时段动态调整")
+        custom_thresholds = json.loads(json.dumps(DEFAULT_THRESHOLDS))
+        for dim in WARNING_DIMENSIONS:
+            st.markdown(f"**{dim}**")
+            c1, c2 = st.columns(2)
+            with c1:
+                warn_key = f"th_warn_{dim}"
+                crit_key = f"th_crit_{dim}"
+                default_warn = DEFAULT_THRESHOLDS[dim]["warning"]
+                default_crit = DEFAULT_THRESHOLDS[dim]["critical"]
+                if dim == "超时率":
+                    custom_thresholds[dim]["warning"] = float(st.number_input(
+                        f"{dim}-预警(%)",
+                        value=float(default_warn * 100), min_value=1.0, max_value=50.0, step=1.0,
+                        key=warn_key)) / 100.0
+                    custom_thresholds[dim]["critical"] = float(st.number_input(
+                        f"{dim}-严重(%)",
+                        value=float(default_crit * 100), min_value=1.0, max_value=50.0, step=1.0,
+                        key=crit_key)) / 100.0
+                elif dim == "供需比":
+                    custom_thresholds[dim]["warning"] = float(st.number_input(
+                        f"{dim}-预警",
+                        value=float(default_warn), min_value=1.0, max_value=30.0, step=0.5,
+                        key=warn_key))
+                    custom_thresholds[dim]["critical"] = float(st.number_input(
+                        f"{dim}-严重",
+                        value=float(default_crit), min_value=1.0, max_value=50.0, step=0.5,
+                        key=crit_key))
+                elif dim == "骑手负载均衡度":
+                    custom_thresholds[dim]["warning"] = int(st.number_input(
+                        f"{dim}-预警(单量差)",
+                        value=int(default_warn), min_value=1, max_value=30, step=1,
+                        key=warn_key))
+                    custom_thresholds[dim]["critical"] = int(st.number_input(
+                        f"{dim}-严重(单量差)",
+                        value=int(default_crit), min_value=1, max_value=50, step=1,
+                        key=crit_key))
+                else:
+                    custom_thresholds[dim]["warning"] = float(st.number_input(
+                        f"{dim}-预警",
+                        value=float(default_warn), min_value=1.0, max_value=3.0, step=0.1,
+                        key=warn_key))
+                    custom_thresholds[dim]["critical"] = float(st.number_input(
+                        f"{dim}-严重",
+                        value=float(default_crit), min_value=1.0, max_value=5.0, step=0.1,
+                        key=crit_key))
+
+    st.markdown("---")
+    st.markdown("### 🧪 验收场景快速触发")
+    with st.expander("🎯 一键触发三种预警场景", expanded=False):
+        st.caption("点击按钮可自动生成场景数据并写入最终预警记录")
+        col_s1, col_s2 = st.columns(2)
+        with col_s1:
+            if st.button("📈 场景1：订单激增", use_container_width=True, key="btn_s1"):
+                st.session_state.trigger_scenario = "供需比预警"
+        with col_s2:
+            if st.button("⏱️ 场景2：超时攀升", use_container_width=True, key="btn_s2"):
+                st.session_state.trigger_scenario = "超时率预警"
+        if st.button("🌧️ 场景3：恶劣天气+高峰复合预警", use_container_width=True, key="btn_s3"):
+            st.session_state.trigger_scenario = "多维度复合预警"
+
+if "trigger_scenario" not in st.session_state:
+    st.session_state.trigger_scenario = None
+
+if st.session_state.trigger_scenario:
+    scenario = st.session_state.trigger_scenario
+    ctx_s, hs_s, rd_s, to_s, wt_s = create_acceptance_scenario(scenario)
+    wi_s = detect_peak_warning_enhanced(ctx_s, hs_s, rd_s, to_s, wt_s, custom_thresholds)
+    snap_s = generate_full_snapshot(ctx_s, hs_s, rd_s, to_s, wt_s)
+    pr_ctx, pr_hs, pr_rd, pr_to, pr_wt = simulate_post_resolution_state(ctx_s, hs_s, rd_s, to_s, wt_s)
+    pr_snap = generate_full_snapshot(pr_ctx, pr_hs, pr_rd, pr_to, pr_wt)
+    rec_s = record_peak_warning_full(wi_s, ctx_s, snap_s, pr_snap, scenario_tag=scenario)
+    st.success(f"✅ {scenario}触发成功！记录ID：{rec_s['record_id']}")
+    st.session_state.trigger_scenario = None
+    st.rerun()
+
 if refresh_btn or "context" not in st.session_state:
     context = generate_business_context(
         selected_date=selected_date,
@@ -66,6 +158,9 @@ if refresh_btn or "context" not in st.session_state:
     st.session_state.warning = detect_peak_warning(
         context, st.session_state.hotspot, st.session_state.rider, st.session_state.timeout
     )
+    st.session_state.warning_enhanced = detect_peak_warning_enhanced(
+        context, st.session_state.hotspot, st.session_state.rider, st.session_state.timeout, st.session_state.weather_data, custom_thresholds
+    )
     st.session_state.subsidy = generate_subsidy_suggestion(context, st.session_state.warning)
 else:
     context = st.session_state.context
@@ -79,6 +174,7 @@ rider_data = st.session_state.rider
 timeout_data = st.session_state.timeout
 weather_data = st.session_state.weather_data
 warning_info = st.session_state.warning
+warning_enhanced = st.session_state.warning_enhanced
 subsidy_info = st.session_state.subsidy
 
 st.markdown("### 📍 当前业务上下文")
@@ -86,29 +182,35 @@ col_ctx1, col_ctx2, col_ctx3, col_ctx4, col_ctx5, col_ctx6 = st.columns(6)
 with col_ctx1:
     st.metric("商圈", ctx["district"])
 with col_ctx2:
-    st.metric("时段", f'{ctx["time_slot"]} {"⭐高峰期" if ctx["is_peak"] else ""}')
+    peak_label = "⭐高峰期" if ctx["is_peak"] else ""
+    st.metric("时段", f"{ctx['time_slot']} {peak_label}")
 with col_ctx3:
-    st.metric("天气", f'{ctx["weather"]} (系数x{ctx["weather_factor"]})')
+    st.metric("天气", f"{ctx['weather']} (系数x{ctx['weather_factor']})")
 with col_ctx4:
     level_color = {"严重": "🔴", "警告": "🟡", "正常": "🟢"}
-    st.metric("预警级别", f'{level_color.get(warning_info["预警级别"], "")} {warning_info["预警级别"]}')
+    warn_level = warning_info["预警级别"]
+    st.metric("预警级别", f"{level_color.get(warn_level, '')} {warn_level}")
 with col_ctx5:
-    st.metric("供需比", f'{warning_info["供需比"]} 单/骑手')
+    sd_ratio = warning_info["供需比"]
+    st.metric("供需比", f"{sd_ratio} 单/骑手")
 with col_ctx6:
     st.metric("责任人", get_district_responsible(ctx["district"]))
+
+effective_th = get_effective_thresholds(ctx, custom_thresholds)
 
 rider_anomaly_info = rider_data.get("异常检测", {})
 if rider_anomaly_info.get("是否异常"):
     st.error(
         f"⚠️ 检测到骑手在线异常（{rider_anomaly_info['异常数量']}项），"
-        f"当前责任人：**{rider_anomaly_info['当前责任人']}** —— "
+        f"当前责任人：**{rider_anomaly_info['当前责任人']} —— "
         f"{rider_anomaly_info['责任人联系建议']}"
     )
 
 st.markdown("---")
 
-tab_hotspot, tab_rider, tab_timeout, tab_weather, tab_operation, tab_playback = st.tabs([
-    "🔥 订单热区", "👥 骑手在线", "⏱️ 超时率", "🌦️ 天气影响", "📝 操作与记录", "🎬 验收与回放"
+tab_hotspot, tab_rider, tab_timeout, tab_weather, tab_warning_list, tab_playback, tab_operation = st.tabs([
+    "🔥 订单热区", "👥 骑手在线", "⏱️ 超时率", "🌦️ 天气影响",
+    "⚠️ 预警记录列表", "🎬 预警回放与对比", "📝 操作与记录"
 ])
 
 with tab_hotspot:
@@ -155,49 +257,15 @@ with tab_hotspot:
 
     st.dataframe(hotspot_df, use_container_width=True, hide_index=True)
 
-    st.markdown("---")
-    col_save_hs, col_snap_hs = st.columns(2)
-    with col_save_hs:
-        if st.button("💾 保存此热区分析为验收快照", key="save_hs_snap"):
-            snap = save_acceptance_snapshot(
-                "订单热区输入",
-                {
-                    "context": ctx,
-                    "hotspot_data": hotspot_df.to_dict(orient="records"),
-                    "hotspot_version_trace": hotspot_version,
-                    "hotspot_summary": hotspot_summary,
-                    "warning_summary": warning_info
-                },
-                f"{ctx['district']}-{ctx['time_slot']} 热区分析"
-            )
-            st.success(f"✅ 已保存热区快照：{snap['snapshot_id']}")
-
 with tab_rider:
     st.subheader("骑手在线状态")
     st.caption("与订单热区共享同一上下文，包含异常检测与责任人信息")
 
     rider_anomaly = rider_data.get("异常检测", {})
     rider_version = rider_data.get("version_trace", {})
-    rider_dim = rider_data.get("看板维度信息", {})
-
-    with st.expander("🔍 数据版本痕迹", expanded=False):
-        if rider_version:
-            col_rv1, col_rv2 = st.columns(2)
-            with col_rv1:
-                st.markdown("**版本信息**")
-                st.markdown(f"- Schema 版本：`{rider_version['schema_version']}`")
-                st.markdown(f"- 数据类型：`{rider_version['data_type']}`")
-                st.markdown(f"- 生成时间：`{rider_version['generated_at']}`")
-                st.markdown(f"- 版本签名：`{rider_version['version_signature']}`")
-            with col_rv2:
-                st.markdown("**上下文摘要**")
-                for k, v in rider_version["context_digest"].items():
-                    st.markdown(f"- {k}：`{v}`")
 
     if rider_anomaly.get("是否异常"):
-        st.error(
-            f"🚨 骑手在线异常警报 —— 当前责任人：**{rider_anomaly['当前责任人']}**"
-        )
+        st.error(f"🚨 骑手在线异常警报 —— 当前责任人：**{rider_anomaly['当前责任人']}")
         with st.expander("📋 异常详情与处置建议", expanded=True):
             for idx, anomaly in enumerate(rider_anomaly["异常列表"], 1):
                 severity_icon = "🔴" if anomaly["严重程度"] == "高危" else "🟡"
@@ -207,7 +275,6 @@ with tab_rider:
                     f"描述：{anomaly['异常描述']}  \n"
                     f"建议动作：{anomaly['建议动作']}"
                 )
-            st.markdown(f"> 💡 {rider_anomaly['责任人联系建议']}")
     else:
         st.success("✅ 骑手在线状态正常，未检测到异常")
 
@@ -259,30 +326,8 @@ with tab_rider:
 
     st.dataframe(rider_data["骑手状态分布"], use_container_width=True, hide_index=True)
 
-    with st.expander("📌 看板维度信息", expanded=False):
-        for k, v in rider_dim.items():
-            st.markdown(f"- {k}：`{v}`")
-
 with tab_timeout:
     st.subheader("超时率分析")
-    st.caption("超时判定阈值：8%，与热区、骑手、天气数据联动")
-
-    timeout_version = timeout_data.get("version_trace", {})
-    timeout_dim = timeout_data.get("看板维度信息", {})
-
-    with st.expander("🔍 数据版本痕迹", expanded=False):
-        if timeout_version:
-            col_tv1, col_tv2 = st.columns(2)
-            with col_tv1:
-                st.markdown("**版本信息**")
-                st.markdown(f"- Schema 版本：`{timeout_version['schema_version']}`")
-                st.markdown(f"- 数据类型：`{timeout_version['data_type']}`")
-                st.markdown(f"- 生成时间：`{timeout_version['generated_at']}`")
-                st.markdown(f"- 版本签名：`{timeout_version['version_signature']}`")
-            with col_tv2:
-                st.markdown("**上下文摘要**")
-                for k, v in timeout_version["context_digest"].items():
-                    st.markdown(f"- {k}：`{v}`")
 
     col_t1, col_t2, col_t3, col_t4 = st.columns(4)
     with col_t1:
@@ -311,56 +356,20 @@ with tab_timeout:
             title="近7日超时率趋势", markers=True
         )
         fig_timeout_trend.add_hline(y=8, line_dash="dash", line_color="red",
-                                    annotation_text="阈值 8%")
+                                      annotation_text="阈值 8%")
         st.plotly_chart(fig_timeout_trend, use_container_width=True)
 
     st.dataframe(timeout_data["超时原因分布"], use_container_width=True, hide_index=True)
 
-    with st.expander("📌 看板维度信息", expanded=False):
-        for k, v in timeout_dim.items():
-            st.markdown(f"- {k}：`{v}`")
-
-    st.markdown("---")
-    if st.button("📌 保存此超时率判定为验收快照", key="save_to_snap"):
-        snap = save_acceptance_snapshot(
-            "超时率判定",
-            {
-                "context": ctx,
-                "timeout_data": {k: v.to_dict(orient="records") if isinstance(v, pd.DataFrame) else v
-                                 for k, v in timeout_data.items()},
-                "判定结果": "超标" if timeout_data["是否超标"] else "正常"
-            },
-            f"{ctx['district']} 超时率{timeout_data['超时率(%)']}%"
-        )
-        st.success(f"✅ 已保存超时率判定快照：{snap['snapshot_id']}")
-
 with tab_weather:
     st.subheader("天气影响分析")
-    st.caption("天气系数直接影响订单量预估、配送时长和超时率，与其他模块共享上下文")
-
-    weather_version = weather_data.get("version_trace", {})
-    weather_dim = weather_data.get("看板维度信息", {})
-
-    with st.expander("🔍 数据版本痕迹", expanded=False):
-        if weather_version:
-            col_wv1, col_wv2 = st.columns(2)
-            with col_wv1:
-                st.markdown("**版本信息**")
-                st.markdown(f"- Schema 版本：`{weather_version['schema_version']}`")
-                st.markdown(f"- 数据类型：`{weather_version['data_type']}`")
-                st.markdown(f"- 生成时间：`{weather_version['generated_at']}`")
-                st.markdown(f"- 版本签名：`{weather_version['version_signature']}`")
-            with col_wv2:
-                st.markdown("**上下文摘要**")
-                for k, v in weather_version["context_digest"].items():
-                    st.markdown(f"- {k}：`{v}`")
 
     impact = weather_data["影响摘要"]
     col_w1, col_w2, col_w3 = st.columns(3)
     with col_w1:
         st.metric("当前天气", impact["当前天气"])
     with col_w2:
-        st.metric("影响系数", f'x{impact["影响系数"]}')
+        st.metric("影响系数", f"x{impact['影响系数']}")
     with col_w3:
         st.metric("影响等级", impact["影响等级"])
 
@@ -378,17 +387,259 @@ with tab_weather:
     st.markdown("#### 分时段天气影响")
     fig_weather = px.bar(
         weather_data["分时段影响"], x="时段", y=["天气影响订单量", "天气影响超时率(%)"],
-        barmode="group", title="分时段天气影响趋势",
-        hover_data=["是否高峰期", "综合影响系数"]
+        barmode="group", title="分时段天气影响趋势"
     )
     st.plotly_chart(fig_weather, use_container_width=True)
 
-    with st.expander("📌 看板维度信息", expanded=False):
-        for k, v in weather_dim.items():
-            st.markdown(f"- {k}：`{v}`")
+with tab_warning_list:
+    st.subheader("⚠️ 峰值预警最终记录列表")
+    st.caption("支持按商圈、时间、严重等级进行筛选，每条记录包含全景快照可回放")
+
+    st.markdown("#### 🔍 筛选条件")
+    col_f1, col_f2, col_f3, col_f4 = st.columns(4)
+    with col_f1:
+        filter_district = st.selectbox("按商圈筛选", ["全部"] + BUSINESS_DISTRICTS, key="flt_dist")
+    with col_f2:
+        filter_level = st.selectbox("按等级筛选", ["全部", "严重", "警告", "正常"], key="flt_lvl")
+    with col_f3:
+        filter_scenario = st.selectbox("按场景筛选", ["全部", "供需比预警", "超时率预警", "多维度复合预警"], key="flt_scn")
+    with col_f4:
+        today = date.today()
+        date_range = st.date_input("时间范围", value=(today - timedelta(days=7), today), key="flt_date")
+
+    q_dist = None if filter_district == "全部" else filter_district
+    q_level = None if filter_level == "全部" else filter_level
+    q_scenario = None if filter_scenario == "全部" else filter_scenario
+    q_start = None
+    q_end = None
+    if isinstance(date_range, tuple) and len(date_range) == 2:
+        q_start = date_range[0].isoformat() + "T00:00:00"
+        q_end = date_range[1].isoformat() + "T23:59:59"
+
+    filtered_records = query_peak_warnings(
+        district=q_dist, warning_level=q_level,
+        start_time=q_start, end_time=q_end,
+        scenario_tag=q_scenario
+    )
+
+    st.markdown(f"共 **{len(filtered_records)}** 条预警记录")
+
+    filtered_df = warnings_to_dataframe(filtered_records)
+    if filtered_df.empty:
+        st.info("暂无预警记录，请先触发预警或使用左侧验收场景按钮")
+    else:
+        display_cols = ["时间", "预警级别", "商圈", "时段", "天气", "是否高峰期", "供需比", "触发维度", "可回放", "可对比", "场景标签"]
+        st.dataframe(filtered_df[display_cols], use_container_width=True, hide_index=True)
+
+    st.markdown("---")
+    col_op1, col_op2, col_op3 = st.columns([1, 1, 1])
+    with col_op1:
+        if st.button("📝 将当前上下文生成全景快照预警", use_container_width=True):
+            curr_snap = generate_full_snapshot(ctx, hotspot_wrapper, rider_data, timeout_data, weather_data)
+            pr_ctx, pr_hs, pr_rd, pr_to, pr_wt = simulate_post_resolution_state(
+                ctx, hotspot_wrapper, rider_data, timeout_data, weather_data
+            )
+            pr_snap = generate_full_snapshot(pr_ctx, pr_hs, pr_rd, pr_to, pr_wt)
+            rec = record_peak_warning_full(
+                warning_enhanced, ctx, curr_snap, pr_snap, scenario_tag="手动触发"
+            )
+            st.success(f"✅ 已记录全景预警，ID：{rec['record_id']}")
+            st.rerun()
+    with col_op2:
+        if st.button("🧹 清空所有预警记录", use_container_width=True):
+            clear_all_warnings()
+            st.success("✅ 已清空所有预警记录")
+            st.rerun()
+    with col_op3:
+        st.caption("提示：点击左侧验收场景按钮可快速触发三种验收预警")
+
+    st.markdown("---")
+    if filtered_records:
+        st.markdown("### 📊 预警维度检测详情（当前上下文）")
+        with st.expander("🔬 四维阈值命中详情", expanded=True):
+            dim_df_list = []
+            for dim in WARNING_DIMENSIONS:
+                detail = warning_enhanced["维度检测详情"][dim]
+                level = "正常"
+                for hit in warning_enhanced["阈值命中详情"]:
+                    if hit["dimension"] == dim:
+                        level = hit["hit_level"]
+                dim_df_list.append({
+                    "监测维度": dim,
+                    "当前值": detail["当前值"],
+                    "预警阈值": detail["预警阈值"],
+                    "严重阈值": detail["严重阈值"],
+                    "动态阈值": "是" if detail["是否动态阈值"] else "否",
+                    "时段系数": detail["时段调整系数"],
+                    "命中等级": level
+                })
+            st.dataframe(pd.DataFrame(dim_df_list), use_container_width=True, hide_index=True)
+
+
+def _render_snapshot_panel(snap, mode="warning"):
+    if snap:
+        ctx_s = snap.get("business_context", {})
+        dims = snap.get("dimension_values", {})
+        level = snap.get("overall_warning_level", "正常")
+
+        c1, c2, c3, c4 = st.columns(4)
+        level_icon = {"严重": "🔴", "警告": "🟡", "正常": "🟢"}.get(level, "⚪")
+        with c1:
+            st.metric("商圈", ctx_s.get("district", ""))
+        with c2:
+            st.metric("时段", ctx_s.get("time_slot", ""))
+        with c3:
+            st.metric("天气", f"{ctx_s.get('weather', '')} x{ctx_s.get('weather_factor', '')}")
+        with c4:
+            st.metric("预警等级", f"{level_icon} {level}")
+
+        st.markdown("##### 📊 四维指标")
+        m1, m2, m3, m4 = st.columns(4)
+        with m1:
+            sd = dims.get("供需比", 0)
+            st.metric("供需比", f"{sd} 单/骑手")
+        with m2:
+            tr = dims.get("超时率", 0)
+            st.metric("超时率", f"{round(tr * 100, 2)}%")
+        with m3:
+            lb = dims.get("骑手负载均衡度", 0)
+            st.metric("负载单量差", f"{lb} 单")
+        with m4:
+            ws = dims.get("天气恶劣指数", 0)
+            st.metric("天气指数", f"x{ws}")
+
+        st.markdown("##### 🔥 订单热区图像")
+        img_b64 = snap.get("hotspot_image_base64", "")
+        if img_b64:
+            try:
+                img_bytes = base64.b64decode(img_b64)
+                st.image(img_bytes, use_column_width=True, caption=f"{ctx_s.get('district', '')} 热区分布图")
+            except Exception:
+                st.warning("热区图像解码失败")
+        else:
+            st.info("无热区图像")
+
+        modules = snap.get("modules_state", {})
+
+        st.markdown("##### 👥 骑手分布点位")
+        rider_pts = snap.get("rider_distribution_points", [])
+        if rider_pts:
+            rider_df = pd.DataFrame(rider_pts)
+            if not rider_df.empty:
+                fig_rider_map = px.scatter(
+                    rider_df, x="x", y="y", color="status",
+                    hover_data=["rider_id", "sub_area", "current_orders"],
+                    title=f"骑手分布（共{len(rider_pts)}人）",
+                    color_discrete_map={"配送中": "#e74c3c", "空闲": "#2ecc71", "取餐中": "#f1c40f"}
+                )
+                st.plotly_chart(fig_rider_map, use_container_width=True)
+
+        st.markdown("##### ⏱️ 各时段超时率")
+        to_arr = snap.get("timeout_rate_array", [])
+        if to_arr:
+            to_df = pd.DataFrame(to_arr)
+            if not to_df.empty:
+                fig_to = go.Figure()
+                fig_to.add_trace(go.Bar(
+                    x=to_df["time_slot"], y=to_df["timeout_rate_pct"],
+                    name="超时率(%)", marker_color="#e74c3c"
+                ))
+                fig_to.add_hline(y=8, line_dash="dash", line_color="red",
+                                     annotation_text="阈值8%")
+                fig_to.update_layout(title="各时段超时率")
+                st.plotly_chart(fig_to, use_container_width=True)
+
+        st.markdown("##### 🌦️ 天气数据")
+        wd = snap.get("weather_data_summary", {})
+        if wd:
+            wc1, wc2, wc3, wc4 = st.columns(4)
+            with wc1:
+                st.metric("天气", wd.get("current_weather", ""))
+            with wc2:
+                st.metric("影响系数", f"x{wd.get('impact_factor', 1)}")
+            with wc3:
+                st.metric("影响等级", wd.get("impact_level", ""))
+            with wc4:
+                st.metric("是否恶劣", "是" if wd.get("is_severe") else "否")
+    else:
+        st.info("无快照数据")
+
+
+with tab_playback:
+    st.subheader("🎬 预警详情回放与对比模式")
+    st.caption("选择预警记录查看完整上下文快照，支持预警时刻与解除后30分钟并列对比")
+
+    all_records = get_peak_warnings()
+    if not all_records:
+        st.info("暂无预警记录可供回放")
+    else:
+        record_options = []
+        for r in all_records:
+            ctx_r = r.get("business_context", {})
+            label = f"[{r.get('warning_level','')}] {ctx_r.get('district','')} | {r.get('timestamp','')[:19]} | {r.get('scenario_tag','普通')}"
+            record_options.append((r["record_id"], label))
+
+        selected_id = st.selectbox(
+            "选择要回放的预警记录",
+            [rid for rid, _ in record_options],
+            format_func=lambda rid: next((lab for rrid, lab in record_options if rrid == rid), ""),
+            key="pb_select"
+        )
+
+        selected_record = get_peak_warning_by_id(selected_id)
+        if selected_record:
+            warn_snap = selected_record.get("warning_snapshot", {})
+            post_snap = selected_record.get("post_resolution_snapshot")
+            ctx_r = selected_record.get("business_context", {})
+
+            comp_mode = st.toggle("🔀 开启对比模式（预警时刻 vs 解除后30分钟）",
+                                      value=bool(post_snap), disabled=not post_snap)
+
+            if comp_mode and post_snap:
+                st.info(f"🔀 对比模式：左=预警时刻 | 右=解除后30分钟")
+                col_l, col_r_pane = st.columns(2)
+
+                with col_l:
+                    st.markdown("#### 🔴 预警时刻快照")
+                    _render_snapshot_panel(warn_snap, "warning")
+
+                with col_r_pane:
+                    st.markdown("#### 🟢 解除后30分钟快照")
+                    _render_snapshot_panel(post_snap, "resolved")
+
+            else:
+                _render_snapshot_panel(warn_snap, "warning")
+
+            st.markdown("---")
+            with st.expander("🔍 阈值命中详情", expanded=True):
+                hits = selected_record.get("threshold_hits", [])
+                if hits:
+                    hits_df = pd.DataFrame([{
+                        "维度": h["dimension"],
+                        "当前值": h["value"],
+                        "预警阈值": h["warning_threshold"],
+                        "严重阈值": h["critical_threshold"],
+                        "命中等级": h["hit_level"],
+                        "动态阈值": "是" if h["is_dynamic"] else "否",
+                        "时段系数": h["time_slot_adjust"],
+                        "超标倍数": h["exceed_ratio"]
+                    } for h in hits])
+                    st.dataframe(hits_df, use_container_width=True, hide_index=True)
+                else:
+                    st.info("无阈值命中")
+
+            st.markdown("---")
+            with st.expander("📦 完整原始快照JSON数据", expanded=False):
+                st.json({k: v for k, v in selected_record.items()
+                           if k not in ["warning_snapshot", "post_resolution_snapshot"]})
+                st.markdown("#### 预警时刻快照模块状态：")
+                st.json({k: v for k, v in warn_snap.items() if k != "hotspot_image_base64"})
+                if post_snap:
+                    st.markdown("#### 解除后快照模块状态：")
+                    st.json({k: v for k, v in post_snap.items() if k != "hotspot_image_base64"})
 
 with tab_operation:
-    st.subheader("补贴策略与峰值预警记录")
+    st.subheader("📝 补贴策略与峰值预警记录")
 
     col_op1, col_op2 = st.columns([1, 1])
 
@@ -404,29 +655,16 @@ with tab_operation:
             st.success(f"✅ 已写入操作日志，日志ID：{log_entry['log_id']}")
 
     with col_op2:
-        st.markdown("#### ⚠️ 当前峰值预警")
+        st.markdown("#### ⚠️ 当前峰值预警（增强版四维监测）")
         level_badge = {"严重": "🔴 严重", "警告": "🟡 警告", "正常": "🟢 正常"}
-        st.info(f"预警级别：**{level_badge.get(warning_info['预警级别'], warning_info['预警级别'])}**  |  责任人：**{get_district_responsible(ctx['district'])}**")
+        st.info(f"预警级别：**{level_badge.get(warning_enhanced['预警级别'], warning_enhanced['预警级别'])}**  |  责任人：**{get_district_responsible(ctx['district'])}**")
 
-        for w in warning_info["预警内容"]:
+        for w in warning_enhanced["预警内容"]:
             st.write(f"• {w}")
 
         if st.button("📝 记录峰值预警到最终记录", type="primary", use_container_width=True):
             record = record_peak_warning(warning_info, ctx)
             st.success(f"✅ 已记录峰值预警，记录ID：{record['record_id']}")
-
-        if st.button("📸 保存峰值预警回看快照", use_container_width=True):
-            snap = save_acceptance_snapshot(
-                "峰值预警回看",
-                {
-                    "context": ctx,
-                    "warning_info": warning_info,
-                    "subsidy_info": subsidy_info,
-                    "rider_anomaly": rider_data.get("异常检测", {})
-                },
-                f"{warning_info['预警级别']}预警-{ctx['district']}"
-            )
-            st.success(f"✅ 已保存峰值预警快照：{snap['snapshot_id']}")
 
     st.markdown("---")
     col_log1, col_log2 = st.columns([1, 1])
@@ -440,56 +678,12 @@ with tab_operation:
             st.info("暂无操作日志")
 
     with col_log2:
-        st.markdown("#### 📜 峰值预警记录（最终记录）")
+        st.markdown("#### 📜 峰值预警记录")
         pk_records = get_peak_warnings()
         pk_df = warnings_to_dataframe(pk_records)
         if not pk_df.empty:
-            st.dataframe(pk_df, use_container_width=True, hide_index=True)
+            display_cols = ["时间", "预警级别", "商圈", "时段", "触发维度", "可回放", "场景标签"]
+            st.dataframe(pk_df[display_cols], use_container_width=True, hide_index=True)
         else:
             st.info("暂无峰值预警记录")
 
-with tab_playback:
-    st.subheader("🎬 验收说明与历史回放")
-    st.caption("保留订单热区输入、超时率判定和峰值预警回看的验收快照（含版本痕迹）")
-
-    snap_type = st.radio(
-        "选择验收快照类型",
-        ["全部", "订单热区输入", "超时率判定", "峰值预警回看"],
-        horizontal=True
-    )
-    filter_type = None if snap_type == "全部" else snap_type
-    snapshots = get_acceptance_snapshots(snapshot_type=filter_type)
-    snap_df = snapshots_to_dataframe(snapshots)
-
-    if not snap_df.empty:
-        st.dataframe(snap_df, use_container_width=True, hide_index=True)
-
-        st.markdown("---")
-        st.markdown("#### 🎞️ 选择快照回放详细内容")
-        selected_idx = st.selectbox(
-            "选择要回放的快照",
-            range(len(snapshots)),
-            format_func=lambda i: f"{snapshots[i]['snapshot_type']} | {snapshots[i]['timestamp']} | {snapshots[i]['description']}"
-        )
-        if selected_idx is not None:
-            selected = snapshots[selected_idx]
-            st.markdown(f"**快照ID**：{selected['snapshot_id']}")
-            st.markdown(f"**类型**：{selected['snapshot_type']}")
-            st.markdown(f"**时间**：{selected['timestamp']}")
-            st.markdown(f"**描述**：{selected['description']}")
-
-            with st.expander("🔍 查看完整快照数据（含版本痕迹）", expanded=True):
-                st.json(selected["data"])
-    else:
-        st.info("暂无验收快照，请在各模块中点击保存快照按钮生成")
-
-    st.markdown("---")
-    st.markdown("### 📑 验收说明清单")
-    checklist_items = [
-        ("订单热区输入", get_acceptance_snapshots(snapshot_type="订单热区输入")),
-        ("超时率判定", get_acceptance_snapshots(snapshot_type="超时率判定")),
-        ("峰值预警回看", get_acceptance_snapshots(snapshot_type="峰值预警回看"))
-    ]
-    for name, items in checklist_items:
-        status = "✅ 已保存" if items else "❌ 未保存"
-        st.markdown(f"- **{name}**：{status}（共 {len(items)} 条记录）")

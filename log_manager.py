@@ -2,6 +2,7 @@ import json
 import os
 import pandas as pd
 from datetime import datetime, date
+from copy import deepcopy
 
 OPERATION_LOG_FILE = "operation_logs.json"
 PEAK_WARNING_FILE = "peak_warnings.json"
@@ -37,7 +38,6 @@ def _write_json(filepath, data):
 
 
 def log_subsidy_operation(operator, subsidy_data, context):
-    """记录补贴策略操作日志"""
     log_entry = {
         "log_id": datetime.now().strftime("%Y%m%d%H%M%S%f"),
         "operation_type": "补贴策略",
@@ -59,8 +59,43 @@ def log_subsidy_operation(operator, subsidy_data, context):
     return log_entry
 
 
+def record_peak_warning_full(
+    warning_info, context,
+    warning_snapshot,
+    post_resolution_snapshot=None,
+    scenario_tag=None
+):
+    record = {
+        "record_id": datetime.now().strftime("%Y%m%d%H%M%S%f"),
+        "record_type": "峰值预警",
+        "timestamp": datetime.now().isoformat(),
+        "warning_level": warning_info["预警级别"],
+        "warning_contents": warning_info["预警内容"],
+        "supply_demand_ratio": warning_info["供需比"],
+        "dimension_details": warning_info.get("维度检测详情", {}),
+        "threshold_hits": warning_info.get("阈值命中详情", []),
+        "business_context": {
+            "district": context["district"],
+            "time_slot": context["time_slot"],
+            "weather": context["weather"],
+            "is_peak": context["is_peak"],
+            "weather_factor": context["weather_factor"],
+            "selected_date": str(context.get("selected_date", "")),
+            "responsible": context.get("current_responsible", "")
+        },
+        "warning_snapshot": warning_snapshot,
+        "post_resolution_snapshot": post_resolution_snapshot,
+        "scenario_tag": scenario_tag,
+        "playback_ready": True,
+        "has_comparison": post_resolution_snapshot is not None
+    }
+    records = _read_json(PEAK_WARNING_FILE)
+    records.insert(0, record)
+    _write_json(PEAK_WARNING_FILE, records)
+    return record
+
+
 def record_peak_warning(warning_info, context):
-    """记录峰值预警到最终记录"""
     record = {
         "record_id": datetime.now().strftime("%Y%m%d%H%M%S%f"),
         "record_type": "峰值预警",
@@ -77,8 +112,50 @@ def record_peak_warning(warning_info, context):
     return record
 
 
+def query_peak_warnings(
+    district=None,
+    warning_level=None,
+    start_time=None,
+    end_time=None,
+    scenario_tag=None,
+    limit=100
+):
+    records = _read_json(PEAK_WARNING_FILE)
+    results = []
+
+    for r in records:
+        if district:
+            ctx = r.get("business_context", {})
+            if ctx.get("district") != district:
+                continue
+        if warning_level:
+            if r.get("warning_level") != warning_level:
+                continue
+        if start_time:
+            if r.get("timestamp", "") < start_time:
+                continue
+        if end_time:
+            if r.get("timestamp", "") > end_time:
+                continue
+        if scenario_tag:
+            if r.get("scenario_tag") != scenario_tag:
+                continue
+        results.append(r)
+        if len(results) >= limit:
+            break
+
+    return results
+
+
+def get_peak_warning_by_id(record_id):
+    records = _read_json(PEAK_WARNING_FILE)
+    for r in records:
+        if r.get("record_id") == record_id:
+            return r
+    return None
+
+
 def save_acceptance_snapshot(snapshot_type, data, description=""):
-    """保存验收快照：订单热区输入、超时率判定、峰值预警回看"""
     snapshot = {
         "snapshot_id": datetime.now().strftime("%Y%m%d%H%M%S%f"),
         "snapshot_type": snapshot_type,
@@ -93,19 +170,16 @@ def save_acceptance_snapshot(snapshot_type, data, description=""):
 
 
 def get_operation_logs(limit=100):
-    """获取操作日志"""
     logs = _read_json(OPERATION_LOG_FILE)
     return logs[:limit]
 
 
 def get_peak_warnings(limit=100):
-    """获取峰值预警记录"""
     records = _read_json(PEAK_WARNING_FILE)
     return records[:limit]
 
 
 def get_acceptance_snapshots(snapshot_type=None, limit=100):
-    """获取验收快照"""
     snapshots = _read_json(ACCEPTANCE_SNAPSHOT_FILE)
     if snapshot_type:
         snapshots = [s for s in snapshots if s["snapshot_type"] == snapshot_type]
@@ -113,7 +187,6 @@ def get_acceptance_snapshots(snapshot_type=None, limit=100):
 
 
 def logs_to_dataframe(logs):
-    """将操作日志转为DataFrame便于展示"""
     if not logs:
         return pd.DataFrame()
     rows = []
@@ -136,28 +209,40 @@ def logs_to_dataframe(logs):
 
 
 def warnings_to_dataframe(warnings):
-    """将峰值预警记录转为DataFrame"""
     if not warnings:
         return pd.DataFrame()
     rows = []
     for w in warnings:
         ctx = w.get("business_context", {})
+        level_badge = {
+            "严重": "🔴 严重",
+            "警告": "🟡 警告",
+            "正常": "🟢 正常"
+        }
+        hit_dims = []
+        for hit in w.get("threshold_hits", []):
+            if hit.get("hit_level") != "正常":
+                hit_dims.append(hit["dimension"])
         rows.append({
             "记录ID": w["record_id"],
-            "时间": w["timestamp"],
-            "预警级别": w["warning_level"],
+            "时间": w.get("timestamp", ""),
+            "预警级别": level_badge.get(w.get("warning_level", ""), w.get("warning_level", "")),
+            "预警等级原始": w.get("warning_level", ""),
             "商圈": ctx.get("district", ""),
             "时段": ctx.get("time_slot", ""),
             "天气": ctx.get("weather", ""),
+            "是否高峰期": "是" if ctx.get("is_peak") else "否",
             "供需比": w.get("supply_demand_ratio", ""),
-            "预警数": len(w.get("warning_contents", [])),
-            "可回放": w.get("playback_ready", False)
+            "触发维度": "、".join(hit_dims) if hit_dims else "无",
+            "可回放": "✅" if w.get("playback_ready") else "❌",
+            "可对比": "✅" if w.get("has_comparison") else "❌",
+            "场景标签": w.get("scenario_tag", ""),
+            "预警内容摘要": "；".join(w.get("warning_contents", [])[:2])
         })
     return pd.DataFrame(rows)
 
 
 def snapshots_to_dataframe(snapshots):
-    """将验收快照转为DataFrame"""
     if not snapshots:
         return pd.DataFrame()
     rows = []
@@ -169,3 +254,8 @@ def snapshots_to_dataframe(snapshots):
             "描述": s["description"]
         })
     return pd.DataFrame(rows)
+
+
+def clear_all_warnings():
+    _write_json(PEAK_WARNING_FILE, [])
+    return True
