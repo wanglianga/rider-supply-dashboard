@@ -9,7 +9,8 @@ from data_generator import (
     generate_business_context, generate_hotspot_data,
     generate_rider_data, generate_timeout_data,
     generate_weather_data, detect_peak_warning,
-    generate_subsidy_suggestion
+    generate_subsidy_suggestion, get_district_responsible,
+    get_all_district_responsibles
 )
 from log_manager import (
     log_subsidy_operation, record_peak_warning,
@@ -38,9 +39,17 @@ with st.sidebar:
     time_slot = st.selectbox("分析时段", TIME_SLOTS, index=2)
 
     st.markdown("---")
+    st.info(f"📍 当前商圈责任人：**{get_district_responsible(district)}**")
+
+    st.markdown("---")
     operator = st.text_input("操作人", value="调度员A")
 
     refresh_btn = st.button("🔄 刷新数据（基于当前上下文）", use_container_width=True, type="primary")
+
+    with st.expander("📋 全部商圈责任人一览"):
+        responsibles = get_all_district_responsibles()
+        for d, r in responsibles.items():
+            st.markdown(f"- **{d}**：{r}")
 
 if refresh_btn or "context" not in st.session_state:
     context = generate_business_context(
@@ -62,7 +71,10 @@ else:
     context = st.session_state.context
 
 ctx = st.session_state.context
-hotspot_df = st.session_state.hotspot
+hotspot_wrapper = st.session_state.hotspot
+hotspot_df = hotspot_wrapper["data"]
+hotspot_version = hotspot_wrapper["version_trace"]
+hotspot_summary = hotspot_wrapper["summary"]
 rider_data = st.session_state.rider
 timeout_data = st.session_state.timeout
 weather_data = st.session_state.weather_data
@@ -70,7 +82,7 @@ warning_info = st.session_state.warning
 subsidy_info = st.session_state.subsidy
 
 st.markdown("### 📍 当前业务上下文")
-col_ctx1, col_ctx2, col_ctx3, col_ctx4, col_ctx5 = st.columns(5)
+col_ctx1, col_ctx2, col_ctx3, col_ctx4, col_ctx5, col_ctx6 = st.columns(6)
 with col_ctx1:
     st.metric("商圈", ctx["district"])
 with col_ctx2:
@@ -82,6 +94,16 @@ with col_ctx4:
     st.metric("预警级别", f'{level_color.get(warning_info["预警级别"], "")} {warning_info["预警级别"]}')
 with col_ctx5:
     st.metric("供需比", f'{warning_info["供需比"]} 单/骑手')
+with col_ctx6:
+    st.metric("责任人", get_district_responsible(ctx["district"]))
+
+rider_anomaly_info = rider_data.get("异常检测", {})
+if rider_anomaly_info.get("是否异常"):
+    st.error(
+        f"⚠️ 检测到骑手在线异常（{rider_anomaly_info['异常数量']}项），"
+        f"当前责任人：**{rider_anomaly_info['当前责任人']}** —— "
+        f"{rider_anomaly_info['责任人联系建议']}"
+    )
 
 st.markdown("---")
 
@@ -91,7 +113,24 @@ tab_hotspot, tab_rider, tab_timeout, tab_weather, tab_operation, tab_playback = 
 
 with tab_hotspot:
     st.subheader("订单热区分布")
-    st.caption("基于当前业务上下文实时计算")
+    st.caption("基于当前业务上下文实时计算，包含版本痕迹追踪")
+
+    with st.expander("🔍 数据版本痕迹与摘要", expanded=False):
+        col_v1, col_v2, col_v3 = st.columns(3)
+        with col_v1:
+            st.markdown("**版本信息**")
+            st.markdown(f"- Schema 版本：`{hotspot_version['schema_version']}`")
+            st.markdown(f"- 数据类型：`{hotspot_version['data_type']}`")
+            st.markdown(f"- 生成时间：`{hotspot_version['generated_at']}`")
+            st.markdown(f"- 版本签名：`{hotspot_version['version_signature']}`")
+        with col_v2:
+            st.markdown("**上下文摘要**")
+            for k, v in hotspot_version["context_digest"].items():
+                st.markdown(f"- {k}：`{v}`")
+        with col_v3:
+            st.markdown("**热区统计摘要**")
+            for k, v in hotspot_summary.items():
+                st.markdown(f"- {k}：`{v}`")
 
     col_h1, col_h2 = st.columns([1, 1])
     with col_h1:
@@ -100,14 +139,15 @@ with tab_hotspot:
             color="热区等级",
             color_discrete_map={"低负荷": "#2ecc71", "正常": "#f1c40f", "高热区": "#e74c3c"},
             title="各子区域订单量与热区等级",
-            text="订单量"
+            text="订单量",
+            hover_data=["所属商圈", "配属骑手数", "供需比", "责任人"]
         )
         st.plotly_chart(fig_hotspot, use_container_width=True)
 
     with col_h2:
         fig_supply = px.scatter(
             hotspot_df, x="供需比", y="订单量", size="商户密度",
-            color="热区等级", hover_data=["子区域", "预计送达时长(分钟)"],
+            color="热区等级", hover_data=["子区域", "预计送达时长(分钟)", "配属骑手数", "责任人"],
             color_discrete_map={"低负荷": "#2ecc71", "正常": "#f1c40f", "高热区": "#e74c3c"},
             title="供需比 vs 订单量（气泡大小=商户密度）"
         )
@@ -124,6 +164,8 @@ with tab_hotspot:
                 {
                     "context": ctx,
                     "hotspot_data": hotspot_df.to_dict(orient="records"),
+                    "hotspot_version_trace": hotspot_version,
+                    "hotspot_summary": hotspot_summary,
                     "warning_summary": warning_info
                 },
                 f"{ctx['district']}-{ctx['time_slot']} 热区分析"
@@ -132,9 +174,44 @@ with tab_hotspot:
 
 with tab_rider:
     st.subheader("骑手在线状态")
-    st.caption("与订单热区共享同一上下文")
+    st.caption("与订单热区共享同一上下文，包含异常检测与责任人信息")
 
-    col_r1, col_r2, col_r3, col_r4 = st.columns(4)
+    rider_anomaly = rider_data.get("异常检测", {})
+    rider_version = rider_data.get("version_trace", {})
+    rider_dim = rider_data.get("看板维度信息", {})
+
+    with st.expander("🔍 数据版本痕迹", expanded=False):
+        if rider_version:
+            col_rv1, col_rv2 = st.columns(2)
+            with col_rv1:
+                st.markdown("**版本信息**")
+                st.markdown(f"- Schema 版本：`{rider_version['schema_version']}`")
+                st.markdown(f"- 数据类型：`{rider_version['data_type']}`")
+                st.markdown(f"- 生成时间：`{rider_version['generated_at']}`")
+                st.markdown(f"- 版本签名：`{rider_version['version_signature']}`")
+            with col_rv2:
+                st.markdown("**上下文摘要**")
+                for k, v in rider_version["context_digest"].items():
+                    st.markdown(f"- {k}：`{v}`")
+
+    if rider_anomaly.get("是否异常"):
+        st.error(
+            f"🚨 骑手在线异常警报 —— 当前责任人：**{rider_anomaly['当前责任人']}**"
+        )
+        with st.expander("📋 异常详情与处置建议", expanded=True):
+            for idx, anomaly in enumerate(rider_anomaly["异常列表"], 1):
+                severity_icon = "🔴" if anomaly["严重程度"] == "高危" else "🟡"
+                st.markdown(
+                    f"{severity_icon} **异常 {idx}：{anomaly['异常类型']}**  "
+                    f"（严重程度：{anomaly['严重程度']}）  \n"
+                    f"描述：{anomaly['异常描述']}  \n"
+                    f"建议动作：{anomaly['建议动作']}"
+                )
+            st.markdown(f"> 💡 {rider_anomaly['责任人联系建议']}")
+    else:
+        st.success("✅ 骑手在线状态正常，未检测到异常")
+
+    col_r1, col_r2, col_r3, col_r4, col_r5, col_r6 = st.columns(6)
     with col_r1:
         st.metric("总注册骑手", rider_data["总注册骑手"])
     with col_r2:
@@ -142,7 +219,11 @@ with tab_rider:
     with col_r3:
         st.metric("配送中骑手", rider_data["配送中骑手"])
     with col_r4:
+        st.metric("空闲骑手", rider_data["空闲骑手"])
+    with col_r5:
         st.metric("人均配送单量", f"{rider_data['人均配送单量']}单")
+    with col_r6:
+        st.metric("在线率", f"{rider_data['在线率(%)']}%")
 
     col_r5, col_r6 = st.columns([1, 1])
     with col_r5:
@@ -150,7 +231,8 @@ with tab_rider:
             rider_data["骑手状态分布"],
             names="状态", values="人数",
             title="骑手状态分布",
-            color_discrete_sequence=["#e74c3c", "#3498db", "#95a5a6"]
+            color_discrete_sequence=["#e74c3c", "#3498db", "#95a5a6"],
+            hover_data=["占比(%)"]
         )
         st.plotly_chart(fig_rider_pie, use_container_width=True)
 
@@ -166,14 +248,41 @@ with tab_rider:
             y=rider_data["近期趋势"]["配送中骑手数"],
             mode="lines+markers", name="配送中骑手", line=dict(color="#e74c3c")
         ))
+        fig_rider_trend.add_trace(go.Scatter(
+            x=rider_data["近期趋势"]["时间点"],
+            y=rider_data["近期趋势"]["空闲骑手数"],
+            mode="lines+markers", name="空闲骑手", line=dict(color="#2ecc71"),
+            fill="tonexty"
+        ))
         fig_rider_trend.update_layout(title="近期骑手在线趋势")
         st.plotly_chart(fig_rider_trend, use_container_width=True)
 
     st.dataframe(rider_data["骑手状态分布"], use_container_width=True, hide_index=True)
 
+    with st.expander("📌 看板维度信息", expanded=False):
+        for k, v in rider_dim.items():
+            st.markdown(f"- {k}：`{v}`")
+
 with tab_timeout:
     st.subheader("超时率分析")
     st.caption("超时判定阈值：8%，与热区、骑手、天气数据联动")
+
+    timeout_version = timeout_data.get("version_trace", {})
+    timeout_dim = timeout_data.get("看板维度信息", {})
+
+    with st.expander("🔍 数据版本痕迹", expanded=False):
+        if timeout_version:
+            col_tv1, col_tv2 = st.columns(2)
+            with col_tv1:
+                st.markdown("**版本信息**")
+                st.markdown(f"- Schema 版本：`{timeout_version['schema_version']}`")
+                st.markdown(f"- 数据类型：`{timeout_version['data_type']}`")
+                st.markdown(f"- 生成时间：`{timeout_version['generated_at']}`")
+                st.markdown(f"- 版本签名：`{timeout_version['version_signature']}`")
+            with col_tv2:
+                st.markdown("**上下文摘要**")
+                for k, v in timeout_version["context_digest"].items():
+                    st.markdown(f"- {k}：`{v}`")
 
     col_t1, col_t2, col_t3, col_t4 = st.columns(4)
     with col_t1:
@@ -181,7 +290,7 @@ with tab_timeout:
     with col_t2:
         st.metric("超时订单数", timeout_data["超时订单数"])
     with col_t3:
-        rate_val = round(timeout_data["超时率"] * 100, 2)
+        rate_val = timeout_data["超时率(%)"]
         delta = f"{round(rate_val - 8, 2)}% vs 阈值"
         st.metric("超时率", f"{rate_val}%", delta=delta, delta_color="inverse")
     with col_t4:
@@ -192,21 +301,24 @@ with tab_timeout:
     with col_t5:
         fig_timeout_reason = px.bar(
             timeout_data["超时原因分布"], x="原因", y="订单数",
-            color="占比", title="超时原因分布", text="订单数"
+            color="占比(%)", title="超时原因分布", text="订单数"
         )
         st.plotly_chart(fig_timeout_reason, use_container_width=True)
 
     with col_t6:
         fig_timeout_trend = px.line(
-            timeout_data["近7日趋势"], x="日期", y="超时率",
+            timeout_data["近7日趋势"], x="日期", y="超时率(%)",
             title="近7日超时率趋势", markers=True
         )
-        fig_timeout_trend.add_hline(y=0.08, line_dash="dash", line_color="red",
+        fig_timeout_trend.add_hline(y=8, line_dash="dash", line_color="red",
                                     annotation_text="阈值 8%")
-        fig_timeout_trend.update_layout(yaxis_tickformat=".1%")
         st.plotly_chart(fig_timeout_trend, use_container_width=True)
 
     st.dataframe(timeout_data["超时原因分布"], use_container_width=True, hide_index=True)
+
+    with st.expander("📌 看板维度信息", expanded=False):
+        for k, v in timeout_dim.items():
+            st.markdown(f"- {k}：`{v}`")
 
     st.markdown("---")
     if st.button("📌 保存此超时率判定为验收快照", key="save_to_snap"):
@@ -218,13 +330,30 @@ with tab_timeout:
                                  for k, v in timeout_data.items()},
                 "判定结果": "超标" if timeout_data["是否超标"] else "正常"
             },
-            f"{ctx['district']} 超时率{round(timeout_data['超时率'] * 100, 2)}%"
+            f"{ctx['district']} 超时率{timeout_data['超时率(%)']}%"
         )
         st.success(f"✅ 已保存超时率判定快照：{snap['snapshot_id']}")
 
 with tab_weather:
     st.subheader("天气影响分析")
     st.caption("天气系数直接影响订单量预估、配送时长和超时率，与其他模块共享上下文")
+
+    weather_version = weather_data.get("version_trace", {})
+    weather_dim = weather_data.get("看板维度信息", {})
+
+    with st.expander("🔍 数据版本痕迹", expanded=False):
+        if weather_version:
+            col_wv1, col_wv2 = st.columns(2)
+            with col_wv1:
+                st.markdown("**版本信息**")
+                st.markdown(f"- Schema 版本：`{weather_version['schema_version']}`")
+                st.markdown(f"- 数据类型：`{weather_version['data_type']}`")
+                st.markdown(f"- 生成时间：`{weather_version['generated_at']}`")
+                st.markdown(f"- 版本签名：`{weather_version['version_signature']}`")
+            with col_wv2:
+                st.markdown("**上下文摘要**")
+                for k, v in weather_version["context_digest"].items():
+                    st.markdown(f"- {k}：`{v}`")
 
     impact = weather_data["影响摘要"]
     col_w1, col_w2, col_w3 = st.columns(3)
@@ -233,23 +362,30 @@ with tab_weather:
     with col_w2:
         st.metric("影响系数", f'x{impact["影响系数"]}')
     with col_w3:
-        st.metric("订单增量预估", impact["订单增量预估"])
+        st.metric("影响等级", impact["影响等级"])
 
-    col_w4, col_w5 = st.columns(2)
+    col_w4, col_w5, col_w6 = st.columns(3)
     with col_w4:
-        st.metric("配送时长增加", impact["配送时长增加"])
+        st.metric("订单增量预估", impact["订单增量预估"])
     with col_w5:
-        st.metric("补贴建议", impact["补贴建议"])
+        st.metric("配送时长增加", impact["配送时长增加"])
+    with col_w6:
+        st.metric("骑手供给建议", impact["骑手供给建议"])
 
     st.markdown("#### 各类天气影响对比")
     st.dataframe(weather_data["天气对比表"], use_container_width=True, hide_index=True)
 
     st.markdown("#### 分时段天气影响")
     fig_weather = px.bar(
-        weather_data["分时段影响"], x="时段", y=["天气影响订单量", "天气影响超时率"],
-        barmode="group", title="分时段天气影响趋势"
+        weather_data["分时段影响"], x="时段", y=["天气影响订单量", "天气影响超时率(%)"],
+        barmode="group", title="分时段天气影响趋势",
+        hover_data=["是否高峰期", "综合影响系数"]
     )
     st.plotly_chart(fig_weather, use_container_width=True)
+
+    with st.expander("📌 看板维度信息", expanded=False):
+        for k, v in weather_dim.items():
+            st.markdown(f"- {k}：`{v}`")
 
 with tab_operation:
     st.subheader("补贴策略与峰值预警记录")
@@ -258,7 +394,7 @@ with tab_operation:
 
     with col_op1:
         st.markdown("#### 🎯 当前补贴策略建议")
-        st.info(f"预警级别：**{subsidy_info['预警级别']}**  |  供需比：{warning_info['供需比']}单/骑手")
+        st.info(f"预警级别：**{subsidy_info['预警级别']}**  |  供需比：{warning_info['供需比']}单/骑手  |  责任人：**{get_district_responsible(ctx['district'])}**")
 
         subsidy_df = pd.DataFrame(subsidy_info["补贴策略"])
         st.dataframe(subsidy_df, use_container_width=True, hide_index=True)
@@ -270,7 +406,7 @@ with tab_operation:
     with col_op2:
         st.markdown("#### ⚠️ 当前峰值预警")
         level_badge = {"严重": "🔴 严重", "警告": "🟡 警告", "正常": "🟢 正常"}
-        st.info(f"预警级别：**{level_badge.get(warning_info['预警级别'], warning_info['预警级别'])}**")
+        st.info(f"预警级别：**{level_badge.get(warning_info['预警级别'], warning_info['预警级别'])}**  |  责任人：**{get_district_responsible(ctx['district'])}**")
 
         for w in warning_info["预警内容"]:
             st.write(f"• {w}")
@@ -285,7 +421,8 @@ with tab_operation:
                 {
                     "context": ctx,
                     "warning_info": warning_info,
-                    "subsidy_info": subsidy_info
+                    "subsidy_info": subsidy_info,
+                    "rider_anomaly": rider_data.get("异常检测", {})
                 },
                 f"{warning_info['预警级别']}预警-{ctx['district']}"
             )
@@ -313,7 +450,7 @@ with tab_operation:
 
 with tab_playback:
     st.subheader("🎬 验收说明与历史回放")
-    st.caption("保留订单热区输入、超时率判定和峰值预警回看的验收快照")
+    st.caption("保留订单热区输入、超时率判定和峰值预警回看的验收快照（含版本痕迹）")
 
     snap_type = st.radio(
         "选择验收快照类型",
@@ -341,7 +478,7 @@ with tab_playback:
             st.markdown(f"**时间**：{selected['timestamp']}")
             st.markdown(f"**描述**：{selected['description']}")
 
-            with st.expander("🔍 查看完整快照数据", expanded=True):
+            with st.expander("🔍 查看完整快照数据（含版本痕迹）", expanded=True):
                 st.json(selected["data"])
     else:
         st.info("暂无验收快照，请在各模块中点击保存快照按钮生成")
